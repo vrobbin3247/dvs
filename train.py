@@ -85,7 +85,7 @@ model = Model()
 model = model.to(device)
 
 #loss, optimizer and scheduler
-# Handle class imbalance with weighted loss
+# Use BCEWithLogitsLoss (numerically stable, expects logits from model)
 if args.use_class_weights:
     # Calculate class weights based on training data
     print("Calculating class weights for imbalanced dataset...")
@@ -109,16 +109,12 @@ if args.use_class_weights:
     weight_drunk = total / (2 * drunk_count) if drunk_count > 0 else 1.0
     weight_sober = total / (2 * sober_count) if sober_count > 0 else 1.0
     
-    # For BCELoss, we'll apply weights in the training loop
     pos_weight = torch.tensor([weight_drunk / weight_sober]).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     print(f"  Drunk: {drunk_count}, Sober: {sober_count}")
     print(f"  Class weight ratio (drunk/sober): {weight_drunk/weight_sober:.3f}")
-    
-    # Note: We need to modify model to output logits instead of probabilities
-    print("  WARNING: Model needs to output logits (remove Sigmoid) when using BCEWithLogitsLoss")
 else:
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()  # Use logits loss (numerically stable)
 
 optimizer = torch.optim.Adam(model.parameters(), lr = lr, weight_decay = 5e-5)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, cooldown=5, min_lr=0.00001)
@@ -137,10 +133,10 @@ for epoch in range(num_epochs):
 		inputs = inputs.to(device) #change to device
 		labels = labels.to(device)
 
-		predictions = model(inputs) # predictions
+		logits = model(inputs) # get raw logits
 
 		#now calculate the loss function
-		loss = criterion(predictions.squeeze(), labels.float())
+		loss = criterion(logits.squeeze(), labels.float())
 		
 		#backprop here
 		optimizer.zero_grad()
@@ -148,7 +144,7 @@ for epoch in range(num_epochs):
 		optimizer.step()
 
 		epoch_loss += (loss.data * inputs.shape[0]) 
-		predictions = predictions >= 0.5  # give abnormal label
+		predictions = (torch.sigmoid(logits) >= 0.5)  # apply sigmoid for evaluation
 		train_acc += (predictions.squeeze().float() == labels.float()).sum() #get the accuracy
 	   
 		#print('Ep_Tr:{}/{},step:{}/{},top1:{},loss:{}'.format(epoch, num_epochs, i, train_data_len //batch_size,train_acc1, loss.data))
@@ -169,11 +165,11 @@ for epoch in range(num_epochs):
 		labels = labels.to(device)
 
 		with torch.no_grad(): 
-			predictions = model(inputs)
+			logits = model(inputs)
 
-		loss = criterion(predictions.squeeze(), labels.float()) 
+		loss = criterion(logits.squeeze(), labels.float()) 
 		epoch_loss += (loss.data * inputs.shape[0])   
-		predictions = predictions >= 0.5  # give abnormal label
+		predictions = (torch.sigmoid(logits) >= 0.5)  # apply sigmoid for evaluation
 		
 		val_acc += (predictions.squeeze().float() == labels.float()).sum()
 
@@ -181,13 +177,11 @@ for epoch in range(num_epochs):
 	epoch_loss = (epoch_loss / float(val_data_len))
 	val_acc = val_acc.float()
 	val_acc /= float(val_data_len)
-	print('Epoch: {}/{}, best_acc: {}'.format(epoch, num_epochs, best_acc)) #print the epoch loss
-  
-	if (epoch % 10) == 0 and epoch > 0:  # Don't save at epoch 0
-	  state = {'epoch':epoch+1, 'state_dict':model.state_dict(), 'optimizer':optimizer.state_dict(), 'scheduler':scheduler.state_dict()}
-	  torch.save(state, os.path.join(save_dir, f"3Dconv_epoch{epoch}.pt"))
-	  print(f"  Checkpoint saved at epoch {epoch}")
+	
+	print('Ep_vl: {}/{}, val acc: {}, ls: {}'.format(epoch, num_epochs, val_acc.data, epoch_loss.data))
 
+	scheduler.step(epoch_loss.item()) #for the scheduler 
+	
 	if (best_acc <= val_acc.data):
 		best_acc = val_acc.data
 		state = {'acc':best_acc,'epoch': epoch+1, 'state_dict':model.state_dict(),'optimizer':optimizer.state_dict(),'scheduler':scheduler.state_dict()}
@@ -196,6 +190,8 @@ for epoch in range(num_epochs):
 	
 	print('Epoch: {}/{}, best_acc: {}'.format(epoch, num_epochs, best_acc)) #print the epoch loss
   
-	if (epoch % 10) == 0:
-	  state = {'epoch':epoch+1, 'state_dict':model.state_dict(), 'optimizer':optimizer.state_dict(), 'scheduler':scheduler.state_dict()}
-	  torch.save(state, os.path.join(save_dir, f"3Dconv_epoch{epoch}.pt"))
+	if (epoch % 10) == 0 and epoch > 0:  # Don't save at epoch 0
+		state = {'epoch':epoch+1, 'state_dict':model.state_dict(), 'optimizer':optimizer.state_dict(), 'scheduler':scheduler.state_dict()}
+		torch.save(state, os.path.join(save_dir, f"3Dconv_epoch{epoch}.pt"))
+		print(f"  Checkpoint saved at epoch {epoch}")
+
