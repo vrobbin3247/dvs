@@ -59,7 +59,7 @@ val_data = VideoDataset(mode="val", folder=video_dir + '/', file=csv_file)
 # Use subset of data if requested
 if args.data_fraction < 1.0:
     import random
-    random.seed(42)  # Set seed for reproducibility
+    random.seed(396)  # Set seed for reproducibility
     train_size = int(len(train_data) * args.data_fraction)
     val_size = int(len(val_data) * args.data_fraction)
     
