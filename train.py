@@ -74,6 +74,14 @@ train_data_len = len(train_data)
 
 val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=args.num_workers)
 val_data_len = len(val_data)
+
+print(f"Training samples: {train_data_len}, Validation samples: {val_data_len}")
+
+#model initialization and multi GPU
+device = torch.device ("cuda" if torch.cuda.is_available() else "cpu")
+
+model = Model()
+model = model.to(device)
 #loss, optimizer and scheduler
 # Handle class imbalance with weighted loss
 if args.use_class_weights:
