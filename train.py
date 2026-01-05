@@ -59,6 +59,7 @@ val_data = VideoDataset(mode="val", folder=video_dir + '/', file=csv_file)
 # Use subset of data if requested
 if args.data_fraction < 1.0:
     import random
+    random.seed(42)  # Set seed for reproducibility
     train_size = int(len(train_data) * args.data_fraction)
     val_size = int(len(val_data) * args.data_fraction)
     
@@ -67,7 +68,7 @@ if args.data_fraction < 1.0:
     
     train_data = torch.utils.data.Subset(train_data, train_indices)
     val_data = torch.utils.data.Subset(val_data, val_indices)
-    print(f"  Using {args.data_fraction*100}% of data")
+    print(f"  Using {args.data_fraction*100}% of data (seed=42 for reproducibility)")
 
 train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=args.num_workers)
 train_data_len = len(train_data)
@@ -82,12 +83,25 @@ device = torch.device ("cuda" if torch.cuda.is_available() else "cpu")
 
 model = Model()
 model = model.to(device)
+
 #loss, optimizer and scheduler
 # Handle class imbalance with weighted loss
 if args.use_class_weights:
     # Calculate class weights based on training data
     print("Calculating class weights for imbalanced dataset...")
-    drunk_count = sum(1 for i in range(len(train_data)) if train_data[i][1] == 1.0)
+    
+    # Handle both regular Dataset and Subset
+    drunk_count = 0
+    for i in range(len(train_data)):
+        try:
+            label = train_data[i][1]
+            if label == 1.0:
+                drunk_count += 1
+        except:
+            # If accessing fails, skip class weighting
+            print("  WARNING: Could not access labels for class weighting")
+            break
+    
     sober_count = train_data_len - drunk_count
     
     # Weight inversely proportional to class frequency
@@ -106,20 +120,6 @@ if args.use_class_weights:
 else:
     criterion = nn.BCELoss()
 
-optimizer = torch.optim.Adam(model.parameters(), lr = lr, weight_decay = 5e-5)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, cooldown=5, min_lr=0.00001)
-device = torch.device ("cuda" if torch.cuda.is_available() else "cpu")
-
-#resnet not pre-trained one
-model = Model()
-
-#using more than 1 GPU if available
-#if (torch.cuda.device_count() > 1):
-#   model = nn.DataParallel(model)
-model = model.to(device)
-
-#loss, optimizer and scheduler
-criterion = nn.BCELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr = lr, weight_decay = 5e-5)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, cooldown=5, min_lr=0.00001)
 
@@ -181,11 +181,12 @@ for epoch in range(num_epochs):
 	epoch_loss = (epoch_loss / float(val_data_len))
 	val_acc = val_acc.float()
 	val_acc /= float(val_data_len)
-	
-	print('Ep_vl: {}/{}, val acc: {}, ls: {}'.format(epoch, num_epochs, val_acc.data, epoch_loss.data))
-
-	scheduler.step(epoch_loss.item()) #for the scheduler 
-	
+	print('Epoch: {}/{}, best_acc: {}'.format(epoch, num_epochs, best_acc)) #print the epoch loss
+  
+	if (epoch % 10) == 0 and epoch > 0:  # Don't save at epoch 0
+	  state = {'epoch':epoch+1, 'state_dict':model.state_dict(), 'optimizer':optimizer.state_dict(), 'scheduler':scheduler.state_dict()}
+	  torch.save(state, os.path.join(save_dir, f"3Dconv_epoch{epoch}.pt"))
+	  print(f"  Checkpoint saved at epoch {epoch}")
 
 	if (best_acc <= val_acc.data):
 		best_acc = val_acc.data
