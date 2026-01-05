@@ -128,6 +128,6 @@ class Model(nn.Module):
 		'''Classfn'''
 		out = self.fc(out.view( out.shape[0], -1))
 
-		out = self.probability(out)
+		# out = self.probability(out)
 
 		return out
