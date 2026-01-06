@@ -32,6 +32,7 @@ args = parser.parse_args()
 num_epochs = args.epochs
 batch_size = args.batch_size
 lr = args.lr
+accum_steps = 4  # effective batch size = batch_size * accum_steps = 16
 
 # Save model path
 save_dir = args.save_dir
@@ -46,7 +47,7 @@ print(f"  Data fraction: {args.data_fraction}")
 print(f"  Use class weights: {args.use_class_weights}")
 print(f"  Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
 
-#data loading - pass data paths from arguments
+# Data loading - pass data paths from arguments
 video_dir = args.video_dir if args.video_dir else os.path.join(args.data_dir, 'all_videos')
 csv_file = args.csv_file if args.csv_file else os.path.join(args.data_dir, 'video_files.csv')
 
@@ -68,7 +69,7 @@ if args.data_fraction < 1.0:
     
     train_data = torch.utils.data.Subset(train_data, train_indices)
     val_data = torch.utils.data.Subset(val_data, val_indices)
-    print(f"  Using {args.data_fraction*100}% of data (seed=42 for reproducibility)")
+    print(f"  Using {args.data_fraction*100}% of data (seed=396 for reproducibility)")
 
 train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=args.num_workers)
 train_data_len = len(train_data)
@@ -78,14 +79,13 @@ val_data_len = len(val_data)
 
 print(f"Training samples: {train_data_len}, Validation samples: {val_data_len}")
 
-#model initialization and multi GPU
-device = torch.device ("cuda" if torch.cuda.is_available() else "cpu")
+# Model initialization and multi GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = Model()
 model = model.to(device)
 
-#loss, optimizer and scheduler
-# Use BCEWithLogitsLoss (numerically stable, expects logits from model)
+# Loss, optimizer and scheduler
 if args.use_class_weights:
     # Calculate class weights based on training data
     print("Calculating class weights for imbalanced dataset...")
@@ -116,82 +116,92 @@ if args.use_class_weights:
 else:
     criterion = nn.BCEWithLogitsLoss()  # Use logits loss (numerically stable)
 
-optimizer = torch.optim.Adam(model.parameters(), lr = lr, weight_decay = 5e-5)
+optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-5)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, cooldown=5, min_lr=0.00001)
 
 best_acc = 0.0
 
-print ("Training Started", train_data_len)
-#training
+print("Training Started", train_data_len)
+
+# Training loop
 for epoch in range(num_epochs):
-	train_acc = 0.0
-	epoch_loss = 0.0
-	count = 0.0
+    train_acc = 0.0
+    epoch_loss = 0.0
 
-	model.train()
-	for i, (inputs,labels) in enumerate(train_loader):
-		inputs = inputs.to(device) #change to device
-		labels = labels.to(device)
+    model.train()
+    optimizer.zero_grad()
 
-		logits = model(inputs) # get raw logits
+    for i, (inputs, labels) in enumerate(train_loader):
+        inputs = inputs.to(device)
+        labels = labels.to(device)
 
-		#now calculate the loss function
-		loss = criterion(logits.squeeze(), labels.float())
-		
-		#backprop here
-		optimizer.zero_grad()
-		loss.backward()
-		optimizer.step()
+        logits = model(inputs)
+        loss = criterion(logits.squeeze(), labels.float())
 
-		epoch_loss += (loss.data * inputs.shape[0]) 
-		predictions = (torch.sigmoid(logits) >= 0.5)  # apply sigmoid for evaluation
-		train_acc += (predictions.squeeze().float() == labels.float()).sum() #get the accuracy
-	   
-		#print('Ep_Tr:{}/{},step:{}/{},top1:{},loss:{}'.format(epoch, num_epochs, i, train_data_len //batch_size,train_acc1, loss.data))
-	epoch_loss = (epoch_loss / float(train_data_len))
-	train_acc = train_acc.float()
-	train_acc /= float(train_data_len)
-	
-	print("Ep_Tr: {}/{}, acc: {}, ls: {}".format(epoch, num_epochs, train_acc.item(), epoch_loss.data))    
+        # Gradient accumulation
+        loss = loss / accum_steps
+        loss.backward()
 
+        if (i + 1) % accum_steps == 0 or (i + 1) == len(train_loader):
+            optimizer.step()
+            optimizer.zero_grad()
 
-	#validation
-	model.eval()
-	epoch_loss = 0.0 
-	val_acc = 0.0
+        # Bookkeeping (restore real loss scale)
+        epoch_loss += loss.item() * inputs.size(0) * accum_steps
+        predictions = (torch.sigmoid(logits) >= 0.5)
+        train_acc += (predictions.squeeze().float() == labels.float()).sum().item()
 
-	for i, (inputs,labels) in enumerate(val_loader):
-		inputs = inputs.to(device) #change to device
-		labels = labels.to(device)
+    epoch_loss /= float(train_data_len)
+    train_acc /= float(train_data_len)
 
-		with torch.no_grad(): 
-			logits = model(inputs)
+    print(f"Ep_Tr: {epoch}/{num_epochs}, acc: {train_acc:.4f}, ls: {epoch_loss:.4f}")    
 
-		loss = criterion(logits.squeeze(), labels.float()) 
-		epoch_loss += (loss.data * inputs.shape[0])   
-		predictions = (torch.sigmoid(logits) >= 0.5)  # apply sigmoid for evaluation
-		
-		val_acc += (predictions.squeeze().float() == labels.float()).sum()
+    # Validation
+    model.eval()
+    val_epoch_loss = 0.0 
+    val_acc = 0.0
 
-	#print('Ep_vl: {}/{},step: {}/{},top1:{}'.format(epoch, num_epochs, i, test_data_len //batch_size,val_acc1))
-	epoch_loss = (epoch_loss / float(val_data_len))
-	val_acc = val_acc.float()
-	val_acc /= float(val_data_len)
-	
-	print('Ep_vl: {}/{}, val acc: {}, ls: {}'.format(epoch, num_epochs, val_acc.data, epoch_loss.data))
+    for i, (inputs, labels) in enumerate(val_loader):
+        inputs = inputs.to(device)
+        labels = labels.to(device)
 
-	scheduler.step(epoch_loss.item()) #for the scheduler 
-	
-	if (best_acc <= val_acc.data):
-		best_acc = val_acc.data
-		state = {'acc':best_acc,'epoch': epoch+1, 'state_dict':model.state_dict(),'optimizer':optimizer.state_dict(),'scheduler':scheduler.state_dict()}
-		torch.save(state, os.path.join(save_dir, "best_3Dconv.pt"))
-		print(f"✓ New best model saved! Accuracy: {best_acc:.4f}")
-	
-	print('Epoch: {}/{}, best_acc: {}'.format(epoch, num_epochs, best_acc)) #print the epoch loss
-  
-	if (epoch % 10) == 0 and epoch > 0:  # Don't save at epoch 0
-		state = {'epoch':epoch+1, 'state_dict':model.state_dict(), 'optimizer':optimizer.state_dict(), 'scheduler':scheduler.state_dict()}
-		torch.save(state, os.path.join(save_dir, f"3Dconv_epoch{epoch}.pt"))
-		print(f"  Checkpoint saved at epoch {epoch}")
+        with torch.no_grad(): 
+            logits = model(inputs)
 
+        loss = criterion(logits.squeeze(), labels.float()) 
+        val_epoch_loss += (loss.data * inputs.shape[0])   
+        predictions = (torch.sigmoid(logits) >= 0.5)
+        
+        val_acc += (predictions.squeeze().float() == labels.float()).sum()
+
+    val_epoch_loss = (val_epoch_loss / float(val_data_len))
+    val_acc = val_acc.float()
+    val_acc /= float(val_data_len)
+    
+    print(f'Ep_vl: {epoch}/{num_epochs}, val acc: {val_acc.data:.4f}, ls: {val_epoch_loss.data:.4f}')
+
+    scheduler.step(val_epoch_loss.item())
+    
+    if best_acc <= val_acc.data:
+        best_acc = val_acc.data
+        state = {
+            'acc': best_acc,
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict()
+        }
+        torch.save(state, os.path.join(save_dir, "best_3Dconv.pt"))
+        print(f"✓ New best model saved! Accuracy: {best_acc:.4f}")
+    
+    print(f'Epoch: {epoch}/{num_epochs}, best_acc: {best_acc:.4f}')
+    
+    if (epoch % 10) == 0 and epoch > 0:  # Don't save at epoch 0
+        state = {
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict()
+        }
+        torch.save(state, os.path.join(save_dir, f"3Dconv_epoch{epoch}.pt"))
+        print(f"  Checkpoint saved at epoch {epoch}")
